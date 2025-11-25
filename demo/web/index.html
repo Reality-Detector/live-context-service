@@ -1,9 +1,474 @@
 <!DOCTYPE html>
 <html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Live Context ASR Demo</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 16px;
+      background: #0b0c10;
+      color: #e5e5e5;
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 20px;
+    }
+
+    .controls {
+      margin-bottom: 12px;
+    }
+
+    button {
+      padding: 6px 12px;
+      margin-right: 8px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      background: #1f4068;
+      color: #fff;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    #status {
+      display: inline-block;
+      margin-left: 8px;
+      font-size: 13px;
+    }
+
+    .status-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      margin-left: 4px;
+    }
+
+    .status-ok {
+      background: #145c32;
+      color: #c8f7c5;
+    }
+
+    .status-bad {
+      background: #6b1b25;
+      color: #f8c6ce;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 2fr 1.2fr;
+      grid-gap: 12px;
+      margin-top: 12px;
+    }
+
+    .panel {
+      border-radius: 6px;
+      padding: 8px;
+      background: #141722;
+      border: 1px solid #222632;
+      overflow: hidden;
+    }
+
+    .panel h2 {
+      margin: 0 0 6px 0;
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #a0a7bd;
+    }
+
+    #transcript {
+      font-size: 14px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      max-height: 420px;
+      overflow-y: auto;
+    }
+
+    .utt-span {
+      display: inline;
+    }
+
+    .utt-final {
+      color: #e5e5e5;
+    }
+
+    .utt-partial {
+      color: #c0c6df;
+    }
+
+    .utt-meta {
+      font-size: 11px;
+      color: #7b8198;
+      margin-right: 4px;
+    }
+
+    #finalList {
+      font-size: 13px;
+      line-height: 1.4;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .final-item {
+      margin-bottom: 6px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #222632;
+    }
+
+    .final-meta {
+      font-size: 11px;
+      color: #9aa0b8;
+      margin-bottom: 2px;
+    }
+
+    .tag {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      margin-right: 4px;
+    }
+
+    .tag-ready {
+      background: #145c32;
+      color: #c8f7c5;
+    }
+
+    .tag-skip {
+      background: #3a3f4f;
+      color: #c0c4d4;
+    }
+
+    #log {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      background: #050608;
+      color: #c4c4c4;
+      padding: 6px;
+      border-radius: 4px;
+      max-height: 260px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
 <body>
-<script>
-const ws = new WebSocket("ws://localhost:8765");
-ws.onmessage = (e) => console.log("Event:", e.data);
-</script>
+  <h1>Live Context – Screen Share ASR MVP</h1>
+
+  <div class="controls">
+    <button id="connectBtn">Connect WS</button>
+    <button id="shareBtn" disabled>Start Screen Share (with audio)</button>
+    <span id="status">
+      WS: <span id="wsStatusPill" class="status-pill status-bad">DISCONNECTED</span>
+    </span>
+  </div>
+
+  <div class="layout">
+    <!-- Left: evolving transcript + final list -->
+    <div class="panel">
+      <h2>Transcript (live)</h2>
+      <div id="transcript">– waiting for audio –</div>
+
+      <h2 style="margin-top: 10px;">Final Utterances</h2>
+      <div id="finalList"></div>
+    </div>
+
+    <!-- Right: debug log -->
+    <div class="panel">
+      <h2>Debug Log</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    let ws = null;
+    let audioContext = null;
+    let processor = null;
+
+    const wsStatusPill = document.getElementById("wsStatusPill");
+    const transcriptEl = document.getElementById("transcript");
+    const finalListEl = document.getElementById("finalList");
+    const logEl = document.getElementById("log");
+
+    // utteranceId -> { id, tStart, tEnd, finalText, latestText, isFinal, quality }
+    const utterances = new Map();
+
+    function log(msg) {
+      console.log(msg);
+      logEl.textContent += msg + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setWsStatus(connected) {
+      if (connected) {
+        wsStatusPill.textContent = "CONNECTED";
+        wsStatusPill.classList.remove("status-bad");
+        wsStatusPill.classList.add("status-ok");
+      } else {
+        wsStatusPill.textContent = "DISCONNECTED";
+        wsStatusPill.classList.remove("status-ok");
+        wsStatusPill.classList.add("status-bad");
+      }
+    }
+
+    function formatSeconds(sec) {
+      if (sec === undefined || isNaN(sec)) return "??:??";
+      const s = Math.max(0, Math.floor(sec));
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return `${m.toString().padStart(2, "0")}:${r.toString().padStart(2, "0")}`;
+    }
+
+    function upsertUtteranceFromPartial(msg) {
+      const id = msg.utterance_id;
+      const q = msg.quality || {};
+      const existing = utterances.get(id) || {
+        id,
+        tStart: msg.t_start ?? 0,
+        tEnd: msg.t_end ?? 0,
+        finalText: null,
+        latestText: "",
+        isFinal: false,
+        quality: q
+      };
+
+      existing.latestText = msg.text;
+      existing.tStart = (msg.t_start !== undefined) ? msg.t_start : existing.tStart;
+      existing.tEnd = (msg.t_end !== undefined) ? msg.t_end : existing.tEnd;
+      existing.isFinal = false;
+      existing.quality = q;
+      utterances.set(id, existing);
+    }
+
+    function upsertUtteranceFromFinal(msg) {
+      const id = msg.utterance_id;
+      const q = msg.quality || {};
+      const existing = utterances.get(id) || {
+        id,
+        tStart: msg.t_start ?? 0,
+        tEnd: msg.t_end ?? 0,
+        finalText: null,
+        latestText: "",
+        isFinal: false,
+        quality: q
+      };
+
+      existing.finalText = msg.raw_text;
+      existing.latestText = msg.raw_text;
+      existing.tStart = (msg.t_start !== undefined) ? msg.t_start : existing.tStart;
+      existing.tEnd = (msg.t_end !== undefined) ? msg.t_end : existing.tEnd;
+      existing.isFinal = true;
+      existing.quality = q;
+      utterances.set(id, existing);
+    }
+
+    function renderTranscript() {
+  if (utterances.size === 0) {
+    transcriptEl.textContent = "– waiting for audio –";
+    return;
+  }
+
+  const items = Array.from(utterances.values()).sort((a, b) => a.tStart - b.tStart);
+
+  // Build the stable part of the transcript from ALL final utterances.
+  let finalTextPieces = [];
+  for (const u of items) {
+    if (u.isFinal && (u.finalText || u.latestText)) {
+      finalTextPieces.push(u.finalText || u.latestText);
+    }
+  }
+  const finalText = finalTextPieces.join(" ");
+
+  // Find the most recent non-final utterance (current live chunk, if any).
+  const nonFinalItems = items.filter((u) => !u.isFinal && (u.latestText || u.finalText));
+  const currentPartial = nonFinalItems.length > 0 ? nonFinalItems[nonFinalItems.length - 1] : null;
+
+  transcriptEl.innerHTML = "";
+
+  // Stable, committed transcript
+  if (finalText) {
+    const finalSpan = document.createElement("span");
+    finalSpan.className = "utt-span utt-final";
+    finalSpan.textContent = finalText;
+    transcriptEl.appendChild(finalSpan);
+  }
+
+  // Current live tail (partial) – lighter color, appended after a space
+  if (currentPartial) {
+    const partialSpan = document.createElement("span");
+    partialSpan.className = "utt-span utt-partial";
+    const prefix = finalText ? " " : "";
+    partialSpan.textContent = prefix + (currentPartial.latestText || currentPartial.finalText || "");
+    transcriptEl.appendChild(partialSpan);
+  }
+
+  if (!finalText && !currentPartial) {
+    transcriptEl.textContent = "– waiting for audio –";
+  }
+
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+
+    function renderFinalList() {
+      finalListEl.innerHTML = "";
+      if (utterances.size === 0) return;
+
+      const items = Array.from(utterances.values())
+        .filter(u => u.isFinal)
+        .sort((a, b) => a.tStart - b.tStart);
+
+      items.forEach((u) => {
+        const q = u.quality || {};
+        const wc = q.word_count ?? "?";
+        const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
+        const ready = q.langchain_ready ? "READY" : "skip";
+        const tLabel = formatSeconds(u.tStart);
+
+        const div = document.createElement("div");
+        div.className = "final-item";
+
+        const meta = document.createElement("div");
+        meta.className = "final-meta";
+
+        const tag = document.createElement("span");
+        tag.className = "tag " + (q.langchain_ready ? "tag-ready" : "tag-skip");
+        tag.textContent = ready;
+
+        meta.appendChild(tag);
+        meta.appendChild(document.createTextNode(
+          ` utt=${u.id} • t=${tLabel} • wc=${wc} • conf=${conf}`
+        ));
+
+        const textDiv = document.createElement("div");
+        textDiv.textContent = u.finalText || u.latestText || "";
+
+        div.appendChild(meta);
+        div.appendChild(textDiv);
+
+        finalListEl.appendChild(div);
+      });
+    }
+
+    document.getElementById("connectBtn").onclick = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        log("WebSocket already connected");
+        return;
+      }
+
+      ws = new WebSocket("ws://localhost:8765");
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        log("✅ WebSocket connected");
+        setWsStatus(true);
+        document.getElementById("shareBtn").disabled = false;
+      };
+
+      ws.onclose = () => {
+        log("❌ WebSocket closed");
+        setWsStatus(false);
+        document.getElementById("shareBtn").disabled = true;
+      };
+
+      ws.onerror = (e) => {
+        log("❌ WebSocket error");
+        console.error(e);
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+
+          if (msg.type === "partial_utterance") {
+            upsertUtteranceFromPartial(msg);
+            renderTranscript();
+          } else if (msg.type === "final_utterance") {
+            upsertUtteranceFromFinal(msg);
+            renderTranscript();
+            renderFinalList();
+          } else if (msg.type === "session_started") {
+            log("Session started: " + JSON.stringify(msg.config));
+          } else if (msg.type === "session_stopped") {
+            log("Session stopped");
+          } else if (msg.type === "context_window_ready") {
+            // Optional: log context windows
+            const q = msg.quality || {};
+            const wc = q.word_count ?? "?";
+            const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
+            log(`[CTX][${msg.window_id}] wc=${wc} conf=${conf}\n${msg.text}`);
+          } else {
+            log("Event: " + e.data);
+          }
+        } catch (err) {
+          // Non-JSON fallback
+          log("Server message: " + e.data);
+        }
+      };
+    };
+
+    document.getElementById("shareBtn").onclick = async () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log("WebSocket not connected");
+        return;
+      }
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true
+        });
+      } catch (err) {
+        log("Failed to start screen share: " + err);
+        return;
+      }
+
+      log("Screen share started");
+
+      // Audio pipeline in browser → PCM16 → WS
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContext.createMediaStreamSource(stream);
+
+      const bufferSize = 4096;
+      const inputChannels = 1;
+      const outputChannels = 1;
+      processor = audioContext.createScriptProcessor(bufferSize, inputChannels, outputChannels);
+
+      processor.onaudioprocess = (audioEvent) => {
+        const inputBuffer = audioEvent.inputBuffer;
+        const channelData = inputBuffer.getChannelData(0); // Float32Array [-1, 1]
+
+        const pcm16 = floatTo16BitPCM(channelData);
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(pcm16.buffer);
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      log("Streaming audio to server...");
+    };
+
+    function floatTo16BitPCM(float32Array) {
+      const len = float32Array.length;
+      const pcm16 = new Int16Array(len);
+      for (let i = 0; i < len; i++) {
+        let s = float32Array[i];
+        s = Math.max(-1, Math.min(1, s));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return pcm16;
+    }
+  </script>
 </body>
 </html>

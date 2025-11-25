@@ -1,5 +1,5 @@
 # live-context-service
-ASR + OCR ingestion layer that feeds claims into LangChainAgents.
+ASR + OCR ingestion layer that feeds claims into LangChainAgents for claim retrieval + fact-checking. 
 
 
 
