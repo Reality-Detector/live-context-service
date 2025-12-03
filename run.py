@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from src.live_context.core.session import Session
 from src.live_context.providers.deepgram_asr import DeepgramASRProvider
 from src.live_context.server.ws_server import WSServer
+from src.live_context.sinks import LangChainSink
 
 
 async def main():
@@ -32,6 +33,9 @@ async def main():
     provider = DeepgramASRProvider(session_id=session.session_id)
     session.attach_asr_provider(provider)
 
+    # Forward final utterances to LangChainAgents
+    langchain_sink = LangChainSink(session.event_bus)
+
     # Start session (which starts Deepgram stream)
     await session.start()
 
@@ -39,8 +43,11 @@ async def main():
     ws_server = WSServer(session)
     await ws_server.start()
 
-    # Run forever
-    await ws_server.wait_forever()
+    try:
+        # Run forever
+        await ws_server.wait_forever()
+    finally:
+        await langchain_sink.close()
 
 
 if __name__ == "__main__":

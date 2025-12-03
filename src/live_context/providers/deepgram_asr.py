@@ -3,21 +3,36 @@ import os
 import json
 import asyncio
 import websockets
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Tuple
 
 from .base_asr import ASRProvider
 from ..adapters.audio_frame import AudioFrame
 from ..protocol import events_v1
 from ..core.quality import compute_quality
 
-# Explicitly describe audio format & options to Deepgram
+# Explicitly describe audio format & options to Deepgram.
+# We enable:
+# - interim_results=true  → partial hypotheses while user is speaking
+# - endpointing           → VAD-based silence detection to emit periodic finals
+# - utterance_end_ms      → gap-based utterance boundaries for more semantic chunks
 DEEPGRAM_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?encoding=linear16"
     "&sample_rate=48000"
+    # Model and formatting
+    "&model=nova-3-general"
     "&punctuate=true"
     "&interim_results=true"
+    # Diarization stays enabled for future use
     "&diarize=true"
+    # Endpointing / segmentation:
+    #   - endpointing: ms of silence before Deepgram finalizes a segment
+    #   - utterance_end_ms: ms gap between recognized words to trigger UtteranceEnd
+    # These values can be tuned, but are a reasonable starting point for
+    # sentence-like segments in typical speech or video audio.
+    "&endpointing=750"
+    "&utterance_end_ms=1000"
+    "&vad_events=true"
 )
 
 
@@ -38,8 +53,18 @@ class DeepgramASRProvider(ASRProvider):
         self._receiver_task: Optional[asyncio.Task] = None
 
         # Utterance tracking
+        # We maintain a monotonically increasing sequence counter and track the
+        # "open" utterance per speaker so that:
+        #   - each utterance_id is tied to exactly one speaker, and
+        #   - each speaker has at most one active utterance receiving partials.
         self._next_utt_seq: int = 1
-        self._current_utt_id: Optional[str] = None
+        self._current_utt_by_speaker: Dict[str, str] = {}
+
+        # Speaker smoothing: track the last stable speaker we emitted so we can
+        # avoid dropping to UNKNOWN or rapidly flapping between speakers when
+        # Deepgram's diarization is uncertain. Threshold is in seconds.
+        self._last_stable_speaker: Optional[str] = None
+        self._speaker_min_duration: float = 0.15
 
     # ---------- Connection management ----------
 
@@ -103,6 +128,61 @@ class DeepgramASRProvider(ASRProvider):
         except Exception as e:
             print("Deepgram receive loop error:", e)
 
+    def _infer_speaker(self, words: List[Dict[str, Any]]) -> Tuple[str, float]:
+        """
+        Infer a stable speaker label (e.g. "spk_0", "spk_1") from Deepgram's
+        diarized word-level metadata.
+        Returns a tuple of (speaker_label, total_word_duration_for_label).
+        """
+        if not words:
+            return "UNKNOWN", 0.0
+
+        durations: Dict[str, float] = {}
+        for w in words:
+            sp = w.get("speaker")
+            if sp is None:
+                continue
+
+            try:
+                idx = int(sp)
+            except Exception:
+                continue
+
+            key = f"spk_{idx}"
+            try:
+                start = float(w.get("start", 0.0))
+                end = float(w.get("end", 0.0))
+                dur = end - start
+                if dur <= 0:
+                    dur = 0.01
+            except Exception:
+                dur = 0.01
+
+            durations[key] = durations.get(key, 0.0) + dur
+
+        if not durations:
+            return "UNKNOWN", 0.0
+
+        # Pick the speaker that dominates this utterance by total word duration.
+        label, dur = max(durations.items(), key=lambda kv: kv[1])
+        return label, float(dur)
+
+    def _stabilize_speaker_label(self, speaker: str, duration: float) -> str:
+        """
+        Apply simple smoothing so extremely short or missing diarization segments
+        fall back to the previously stable speaker instead of creating flicker.
+        """
+        if speaker == "UNKNOWN":
+            return self._last_stable_speaker or "UNKNOWN"
+
+        if duration < self._speaker_min_duration and self._last_stable_speaker:
+            # Treat very short, low-confidence diarization as likely belonging to
+            # the previously active speaker.
+            return self._last_stable_speaker
+
+        self._last_stable_speaker = speaker
+        return speaker
+
     async def _handle_message(self, msg: Any) -> None:
         if self._on_event is None:
             return
@@ -126,7 +206,15 @@ class DeepgramASRProvider(ASRProvider):
             return
 
         confidence = float(alt.get("confidence") or 0.0)
-        is_final: bool = bool(channel.get("is_final", False))
+
+        # Deepgram v1 listen results expose finality at the top level as
+        # `is_final` / `speech_final`. Older examples sometimes showed this
+        # on `channel`, so we OR them together for robustness.
+        is_final: bool = bool(
+            data.get("is_final")
+            or data.get("speech_final")
+            or channel.get("is_final", False)
+        )
 
         # Extract timing from words if available
         words = alt.get("words") or []
@@ -139,17 +227,20 @@ class DeepgramASRProvider(ASRProvider):
         else:
             t_start = t_end = 0.0
 
-        # Simple diarization placeholder – Deepgram can provide speaker info;
-        # for now we just keep UNKNOWN and will refine later.
-        speaker = "UNKNOWN"
+        # ---------- Speaker & utterance ID handling ----------
+        # Use Deepgram diarization (word.speaker) to infer a stable speaker label,
+        # apply light smoothing, then maintain a single active utterance per speaker.
+        speaker_label, speaker_duration = self._infer_speaker(words)
+        speaker = self._stabilize_speaker_label(speaker_label, speaker_duration)
 
-        # ---------- Utterance ID handling ----------
-        # Reuse a single utterance ID across all partials until we get a final.
-        if self._current_utt_id is None:
-            self._current_utt_id = "utt_{}".format(self._next_utt_seq)
+        utt_id = self._current_utt_by_speaker.get(speaker)
+        if utt_id is None:
+            # Incorporate speaker in the utterance_id to make it easy to debug
+            # and to keep IDs unique across speakers.
+            base = speaker if speaker != "UNKNOWN" else "utt"
+            utt_id = f"{base}_{self._next_utt_seq}"
             self._next_utt_seq += 1
-
-        utt_id = self._current_utt_id
+            self._current_utt_by_speaker[speaker] = utt_id
 
         # ---------- Quality metrics ----------
         quality = compute_quality(text=text, confidence=confidence, is_final=is_final)
@@ -179,5 +270,6 @@ class DeepgramASRProvider(ASRProvider):
             event["quality"] = quality
             self._on_event(event)
 
-            # Current utterance is now complete; next result starts a new one.
-            self._current_utt_id = None
+            # Current utterance for this speaker is now complete; next result
+            # from the same speaker will start a new utterance.
+            self._current_utt_by_speaker.pop(speaker, None)

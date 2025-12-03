@@ -91,8 +91,9 @@
       overflow-y: auto;
     }
 
-    .utt-span {
-      display: inline;
+    .utt-line {
+      display: block;
+      margin-bottom: 4px;
     }
 
     .utt-final {
@@ -160,7 +161,7 @@
   </style>
 </head>
 <body>
-  <h1>Live Context – Screen Share ASR MVP</h1>
+  <h1>Live Context – Screen Share ASR</h1>
 
   <div class="controls">
     <button id="connectBtn">Connect WS</button>
@@ -197,8 +198,9 @@
     const finalListEl = document.getElementById("finalList");
     const logEl = document.getElementById("log");
 
-    // utteranceId -> { id, tStart, tEnd, finalText, latestText, isFinal, quality }
+    // utteranceId -> { id, speaker, tStart, tEnd, finalText, latestText, isFinal, quality }
     const utterances = new Map();
+    const renderedFinalIds = new Set();
 
     function log(msg) {
       console.log(msg);
@@ -226,11 +228,31 @@
       return `${m.toString().padStart(2, "0")}:${r.toString().padStart(2, "0")}`;
     }
 
+    function getTextPayload(msg) {
+      if (!msg) return "";
+      if (typeof msg.text === "string" && msg.text.length > 0) return msg.text;
+      if (typeof msg.raw_text === "string" && msg.raw_text.length > 0) return msg.raw_text;
+      return "";
+    }
+
+    function withTrailingSpace(text) {
+      if (!text) return "";
+      return text.endsWith(" ") ? text : `${text} `;
+    }
+
+    function resetSessionState() {
+      utterances.clear();
+      renderedFinalIds.clear();
+      finalListEl.innerHTML = "";
+      transcriptEl.textContent = "– waiting for audio –";
+    }
+
     function upsertUtteranceFromPartial(msg) {
       const id = msg.utterance_id;
       const q = msg.quality || {};
       const existing = utterances.get(id) || {
         id,
+        speaker: msg.speaker || "UNKNOWN",
         tStart: msg.t_start ?? 0,
         tEnd: msg.t_end ?? 0,
         finalText: null,
@@ -239,7 +261,8 @@
         quality: q
       };
 
-      existing.latestText = msg.text;
+      existing.speaker = msg.speaker || existing.speaker || "UNKNOWN";
+      existing.latestText = getTextPayload(msg);
       existing.tStart = (msg.t_start !== undefined) ? msg.t_start : existing.tStart;
       existing.tEnd = (msg.t_end !== undefined) ? msg.t_end : existing.tEnd;
       existing.isFinal = false;
@@ -252,6 +275,7 @@
       const q = msg.quality || {};
       const existing = utterances.get(id) || {
         id,
+        speaker: msg.speaker || "UNKNOWN",
         tStart: msg.t_start ?? 0,
         tEnd: msg.t_end ?? 0,
         finalText: null,
@@ -260,8 +284,10 @@
         quality: q
       };
 
-      existing.finalText = msg.raw_text;
-      existing.latestText = msg.raw_text;
+      existing.speaker = msg.speaker || existing.speaker || "UNKNOWN";
+      const finalText = getTextPayload(msg);
+      existing.finalText = finalText;
+      existing.latestText = finalText;
       existing.tStart = (msg.t_start !== undefined) ? msg.t_start : existing.tStart;
       existing.tEnd = (msg.t_end !== undefined) ? msg.t_end : existing.tEnd;
       existing.isFinal = true;
@@ -269,92 +295,138 @@
       utterances.set(id, existing);
     }
 
+    // Continuous transcript: all finals rendered as stable text + a single live partial tail.
     function renderTranscript() {
-  if (utterances.size === 0) {
-    transcriptEl.textContent = "– waiting for audio –";
-    return;
-  }
-
-  const items = Array.from(utterances.values()).sort((a, b) => a.tStart - b.tStart);
-
-  // Build the stable part of the transcript from ALL final utterances.
-  let finalTextPieces = [];
-  for (const u of items) {
-    if (u.isFinal && (u.finalText || u.latestText)) {
-      finalTextPieces.push(u.finalText || u.latestText);
-    }
-  }
-  const finalText = finalTextPieces.join(" ");
-
-  // Find the most recent non-final utterance (current live chunk, if any).
-  const nonFinalItems = items.filter((u) => !u.isFinal && (u.latestText || u.finalText));
-  const currentPartial = nonFinalItems.length > 0 ? nonFinalItems[nonFinalItems.length - 1] : null;
-
-  transcriptEl.innerHTML = "";
-
-  // Stable, committed transcript
-  if (finalText) {
-    const finalSpan = document.createElement("span");
-    finalSpan.className = "utt-span utt-final";
-    finalSpan.textContent = finalText;
-    transcriptEl.appendChild(finalSpan);
-  }
-
-  // Current live tail (partial) – lighter color, appended after a space
-  if (currentPartial) {
-    const partialSpan = document.createElement("span");
-    partialSpan.className = "utt-span utt-partial";
-    const prefix = finalText ? " " : "";
-    partialSpan.textContent = prefix + (currentPartial.latestText || currentPartial.finalText || "");
-    transcriptEl.appendChild(partialSpan);
-  }
-
-  if (!finalText && !currentPartial) {
-    transcriptEl.textContent = "– waiting for audio –";
-  }
-
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
-}
-
-
-    function renderFinalList() {
-      finalListEl.innerHTML = "";
-      if (utterances.size === 0) return;
+      if (utterances.size === 0) {
+        transcriptEl.textContent = "– waiting for audio –";
+        return;
+      }
 
       const items = Array.from(utterances.values())
-        .filter(u => u.isFinal)
-        .sort((a, b) => a.tStart - b.tStart);
+        .sort((a, b) => (a.tStart ?? 0) - (b.tStart ?? 0));
 
-      items.forEach((u) => {
-        const q = u.quality || {};
-        const wc = q.word_count ?? "?";
-        const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
-        const ready = q.langchain_ready ? "READY" : "skip";
-        const tLabel = formatSeconds(u.tStart);
+      const finalUtterances = [];
+      let currentPartial = null;
 
-        const div = document.createElement("div");
-        div.className = "final-item";
+      for (const item of items) {
+        const hasText = (item.finalText && item.finalText.length > 0) || (item.latestText && item.latestText.length > 0);
+        if (!hasText) continue;
 
-        const meta = document.createElement("div");
-        meta.className = "final-meta";
+        if (item.isFinal && item.finalText) {
+          finalUtterances.push(item);
+        } else if (!item.isFinal && item.latestText) {
+          if (!currentPartial || (item.tStart ?? 0) >= (currentPartial.tStart ?? 0)) {
+            currentPartial = item;
+          }
+        }
+      }
 
-        const tag = document.createElement("span");
-        tag.className = "tag " + (q.langchain_ready ? "tag-ready" : "tag-skip");
-        tag.textContent = ready;
+      if (finalUtterances.length === 0 && !currentPartial) {
+        transcriptEl.textContent = "– waiting for audio –";
+        return;
+      }
 
-        meta.appendChild(tag);
-        meta.appendChild(document.createTextNode(
-          ` utt=${u.id} • t=${tLabel} • wc=${wc} • conf=${conf}`
-        ));
+      transcriptEl.innerHTML = "";
+      const fragment = document.createDocumentFragment();
 
-        const textDiv = document.createElement("div");
-        textDiv.textContent = u.finalText || u.latestText || "";
+      // Group consecutive final utterances by speaker so each speaker turn
+      // renders as a single line of text.
+      const groupedFinals = [];
+      for (const u of finalUtterances) {
+        const speakerKey = u.speaker || "UNKNOWN";
+        const text = u.finalText || u.latestText || "";
 
-        div.appendChild(meta);
-        div.appendChild(textDiv);
+        if (groupedFinals.length === 0 || groupedFinals[groupedFinals.length - 1].speaker !== speakerKey) {
+          groupedFinals.push({
+            speaker: speakerKey,
+            tStart: u.tStart,
+            tEnd: u.tEnd,
+            utteranceIds: [u.id],
+            texts: [text],
+          });
+        } else {
+          const last = groupedFinals[groupedFinals.length - 1];
+          last.utteranceIds.push(u.id);
+          last.texts.push(text);
+          last.tEnd = u.tEnd;
+        }
+      }
 
-        finalListEl.appendChild(div);
-      });
+      for (const group of groupedFinals) {
+        const line = document.createElement("div");
+        line.className = "utt-line utt-final";
+
+        const speakerLabel = group.speaker && group.speaker !== "UNKNOWN"
+          ? `${group.speaker.toUpperCase()}: `
+          : "";
+
+        const combinedText = withTrailingSpace(group.texts.join(" ").trim());
+        line.textContent = speakerLabel + combinedText;
+        line.dataset.utteranceIds = group.utteranceIds.join(",");
+        line.dataset.speaker = group.speaker || "";
+        line.dataset.tStart = group.tStart;
+        line.dataset.tEnd = group.tEnd;
+        fragment.appendChild(line);
+      }
+
+      if (currentPartial) {
+        const line = document.createElement("div");
+        line.className = "utt-line utt-partial";
+
+        const speakerLabel = currentPartial.speaker && currentPartial.speaker !== "UNKNOWN"
+          ? `${currentPartial.speaker.toUpperCase()}: `
+          : "";
+
+        line.textContent = speakerLabel + (currentPartial.latestText || "");
+        line.dataset.utteranceId = currentPartial.id;
+        line.dataset.speaker = currentPartial.speaker || "";
+        line.dataset.tStart = currentPartial.tStart;
+        line.dataset.tEnd = currentPartial.tEnd;
+        line.dataset.confidence = currentPartial.quality?.avg_confidence ?? "";
+        line.dataset.wordCount = currentPartial.quality?.word_count ?? "";
+        line.dataset.langchainReady = currentPartial.quality?.langchain_ready ?? "false";
+        fragment.appendChild(line);
+      }
+
+      transcriptEl.appendChild(fragment);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function appendFinalListItem(u) {
+      if (!u || !u.isFinal || renderedFinalIds.has(u.id)) {
+        return;
+      }
+
+      const q = u.quality || {};
+      const wc = q.word_count ?? "?";
+      const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
+      const ready = q.langchain_ready ? "READY" : "skip";
+      const tLabel = formatSeconds(u.tStart);
+
+      const div = document.createElement("div");
+      div.className = "final-item";
+
+      const meta = document.createElement("div");
+      meta.className = "final-meta";
+
+      const tag = document.createElement("span");
+      tag.className = "tag " + (q.langchain_ready ? "tag-ready" : "tag-skip");
+      tag.textContent = ready;
+
+      meta.appendChild(tag);
+      meta.appendChild(document.createTextNode(
+        ` utt=${u.id} • spk=${u.speaker || "UNKNOWN"} • t=${tLabel} • wc=${wc} • conf=${conf}`
+      ));
+
+      const textDiv = document.createElement("div");
+      textDiv.textContent = u.finalText || u.latestText || "";
+
+      div.appendChild(meta);
+      div.appendChild(textDiv);
+
+      finalListEl.appendChild(div);
+      finalListEl.scrollTop = finalListEl.scrollHeight;
+      renderedFinalIds.add(u.id);
     }
 
     document.getElementById("connectBtn").onclick = () => {
@@ -393,13 +465,13 @@
           } else if (msg.type === "final_utterance") {
             upsertUtteranceFromFinal(msg);
             renderTranscript();
-            renderFinalList();
+            appendFinalListItem(utterances.get(msg.utterance_id));
           } else if (msg.type === "session_started") {
+            resetSessionState();
             log("Session started: " + JSON.stringify(msg.config));
           } else if (msg.type === "session_stopped") {
             log("Session stopped");
           } else if (msg.type === "context_window_ready") {
-            // Optional: log context windows
             const q = msg.quality || {};
             const wc = q.word_count ?? "?";
             const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
