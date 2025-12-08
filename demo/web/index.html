@@ -179,6 +179,9 @@
 
       <h2 style="margin-top: 10px;">Final Utterances</h2>
       <div id="finalList"></div>
+
+      <h2 style="margin-top: 10px;">Fact Check Results</h2>
+      <div id="factCheckList"></div>
     </div>
 
     <!-- Right: debug log -->
@@ -197,6 +200,7 @@
     const transcriptEl = document.getElementById("transcript");
     const finalListEl = document.getElementById("finalList");
     const logEl = document.getElementById("log");
+    const factCheckListEl = document.getElementById("factCheckList");
 
     // utteranceId -> { id, speaker, tStart, tEnd, finalText, latestText, isFinal, quality }
     const utterances = new Map();
@@ -429,6 +433,40 @@
       renderedFinalIds.add(u.id);
     }
 
+    function appendFactCheckResult(msg) {
+      if (!factCheckListEl) {
+        return;
+      }
+
+      const div = document.createElement("div");
+      div.className = "final-item";
+
+      const meta = document.createElement("div");
+      meta.className = "final-meta";
+      const classification = msg.classification || "unknown";
+      const assessment = msg.overall_assessment || "unknown";
+      meta.textContent = `fact-check ${msg.utterance_id || ""} • ${classification} • ${assessment}`;
+
+      const query = document.createElement("div");
+      query.textContent = msg.query || msg.payload?.query || "No query text";
+
+      const payloadPreview = document.createElement("div");
+      payloadPreview.style.fontSize = "11px";
+      payloadPreview.style.color = "#9aa0b8";
+      payloadPreview.textContent = msg.payload ? JSON.stringify(msg.payload, null, 2) : "";
+
+      div.appendChild(meta);
+      div.appendChild(query);
+      if (payloadPreview.textContent) {
+        div.appendChild(payloadPreview);
+      }
+
+      factCheckListEl.prepend(div);
+      if (factCheckListEl.childElementCount > 6) {
+        factCheckListEl.removeChild(factCheckListEl.lastElementChild);
+      }
+    }
+
     document.getElementById("connectBtn").onclick = () => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         log("WebSocket already connected");
@@ -476,6 +514,9 @@
             const wc = q.word_count ?? "?";
             const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
             log(`[CTX][${msg.window_id}] wc=${wc} conf=${conf}\n${msg.text}`);
+          } else if (msg.type === "fact_check_result") {
+            appendFactCheckResult(msg);
+            log("Fact-check: " + (msg.classification || "unknown") + " / " + (msg.overall_assessment || "unknown"));
           } else {
             log("Event: " + e.data);
           }

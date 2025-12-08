@@ -1,6 +1,8 @@
 # run.py
 import asyncio
 from dotenv import load_dotenv
+load_dotenv(".env.local")
+
 
 from src.live_context.core.session import Session
 from src.live_context.providers.deepgram_asr import DeepgramASRProvider
@@ -9,7 +11,6 @@ from src.live_context.sinks import LangChainSink
 
 
 async def main():
-    load_dotenv(".env.local")
 
     config = {
         "sensors": {
