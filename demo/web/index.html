@@ -117,6 +117,13 @@
       overflow-y: auto;
     }
 
+    #factCheckList {
+      font-size: 13px;
+      line-height: 1.4;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+
     .final-item {
       margin-bottom: 6px;
       padding-bottom: 4px;
@@ -158,6 +165,30 @@
       overflow-y: auto;
       white-space: pre-wrap;
     }
+
+    /* Screen-share preview (bottom-right) */
+    #screenPreviewContainer {
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      width: 280px;
+      height: 158px; /* ~16:9 */
+      background: #000;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid #222632;
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.6);
+      z-index: 1000;
+      display: none; /* shown only when sharing */
+    }
+
+    #screenPreview {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+      display: block;
+    }
   </style>
 </head>
 <body>
@@ -172,14 +203,10 @@
   </div>
 
   <div class="layout">
-    <!-- Left: evolving transcript + final list -->
+    <!-- Left: evolving transcript -->
     <div class="panel">
       <h2>Transcript (live)</h2>
       <div id="transcript">– waiting for audio –</div>
-
-      <h2 style="margin-top: 10px;">Final Utterances</h2>
-      <div id="finalList"></div>
-
       <h2 style="margin-top: 10px;">Fact Check Results</h2>
       <div id="factCheckList"></div>
     </div>
@@ -198,13 +225,22 @@
 
     const wsStatusPill = document.getElementById("wsStatusPill");
     const transcriptEl = document.getElementById("transcript");
-    const finalListEl = document.getElementById("finalList");
     const logEl = document.getElementById("log");
     const factCheckListEl = document.getElementById("factCheckList");
+    const screenPreviewContainer = document.createElement("div");
+    const screenPreviewVideo = document.createElement("video");
+
+    // Build preview container dynamically to avoid altering layout structure.
+    screenPreviewContainer.id = "screenPreviewContainer";
+    screenPreviewVideo.id = "screenPreview";
+    screenPreviewVideo.autoplay = true;
+    screenPreviewVideo.muted = true;
+    screenPreviewVideo.playsInline = true;
+    screenPreviewContainer.appendChild(screenPreviewVideo);
+    document.body.appendChild(screenPreviewContainer);
 
     // utteranceId -> { id, speaker, tStart, tEnd, finalText, latestText, isFinal, quality }
     const utterances = new Map();
-    const renderedFinalIds = new Set();
 
     function log(msg) {
       console.log(msg);
@@ -246,8 +282,6 @@
 
     function resetSessionState() {
       utterances.clear();
-      renderedFinalIds.clear();
-      finalListEl.innerHTML = "";
       transcriptEl.textContent = "– waiting for audio –";
     }
 
@@ -396,75 +430,168 @@
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
     }
 
-    function appendFinalListItem(u) {
-      if (!u || !u.isFinal || renderedFinalIds.has(u.id)) {
-        return;
-      }
-
-      const q = u.quality || {};
-      const wc = q.word_count ?? "?";
-      const conf = q.avg_confidence !== undefined ? q.avg_confidence.toFixed(2) : "?";
-      const ready = q.langchain_ready ? "READY" : "skip";
-      const tLabel = formatSeconds(u.tStart);
-
-      const div = document.createElement("div");
-      div.className = "final-item";
-
-      const meta = document.createElement("div");
-      meta.className = "final-meta";
-
-      const tag = document.createElement("span");
-      tag.className = "tag " + (q.langchain_ready ? "tag-ready" : "tag-skip");
-      tag.textContent = ready;
-
-      meta.appendChild(tag);
-      meta.appendChild(document.createTextNode(
-        ` utt=${u.id} • spk=${u.speaker || "UNKNOWN"} • t=${tLabel} • wc=${wc} • conf=${conf}`
-      ));
-
-      const textDiv = document.createElement("div");
-      textDiv.textContent = u.finalText || u.latestText || "";
-
-      div.appendChild(meta);
-      div.appendChild(textDiv);
-
-      finalListEl.appendChild(div);
-      finalListEl.scrollTop = finalListEl.scrollHeight;
-      renderedFinalIds.add(u.id);
+    // Basic markdown link support: [text](https://example.com)
+    function renderMarkdownWithLinks(text) {
+      if (!text) return "";
+      // Escape HTML to avoid accidental injection, then re-insert links.
+      const esc = text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      return esc.replace(
+        /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+      );
     }
 
     function appendFactCheckResult(msg) {
-      if (!factCheckListEl) {
-        return;
+      if (!factCheckListEl) return;
+
+      const payload = msg.payload || {};
+
+      const claim =
+        msg.query || payload.query || "No claim text provided";
+
+      const classification =
+        payload.Classification || msg.classification || "unknown";
+
+      const fullAssessment =
+        payload.overall_assessment || msg.overall_assessment || "";
+
+      // Split assessment vs evidence by blank line(s), if present
+      let assessment = fullAssessment;
+      let evidence = "";
+      if (fullAssessment && /\n\n+/.test(fullAssessment)) {
+        const parts = fullAssessment.split(/\n\n+/);
+        assessment = parts[0] || "";
+        evidence = parts.slice(1).join("\n\n");
       }
 
-      const div = document.createElement("div");
-      div.className = "final-item";
+      const disambiguation = payload.disambiguation || "";
+      const biasList = payload.bias || [];
 
-      const meta = document.createElement("div");
-      meta.className = "final-meta";
-      const classification = msg.classification || "unknown";
-      const assessment = msg.overall_assessment || "unknown";
-      meta.textContent = `fact-check ${msg.utterance_id || ""} • ${classification} • ${assessment}`;
+      // Outer container for each claim
+      const container = document.createElement("div");
+      container.className = "final-item";
 
-      const query = document.createElement("div");
-      query.textContent = msg.query || msg.payload?.query || "No query text";
+      // Header row (clickable)
+      const header = document.createElement("div");
+      header.style.display = "flex";
+      header.style.alignItems = "center";
+      header.style.justifyContent = "space-between";
+      header.style.cursor = "pointer";
 
-      const payloadPreview = document.createElement("div");
-      payloadPreview.style.fontSize = "11px";
-      payloadPreview.style.color = "#9aa0b8";
-      payloadPreview.textContent = msg.payload ? JSON.stringify(msg.payload, null, 2) : "";
+      // Classification pill
+      const pill = document.createElement("span");
+      const clsLower = String(classification).toLowerCase();
+      const isTrueish =
+        clsLower.includes("true") || clsLower.includes("supported");
 
-      div.appendChild(meta);
-      div.appendChild(query);
-      if (payloadPreview.textContent) {
-        div.appendChild(payloadPreview);
+      pill.className = "tag " + (isTrueish ? "tag-ready" : "tag-skip");
+      pill.textContent = classification;
+
+      // Short claim preview
+      const claimPreview = document.createElement("div");
+      claimPreview.style.marginLeft = "8px";
+      claimPreview.style.fontSize = "12px";
+      claimPreview.style.whiteSpace = "nowrap";
+      claimPreview.style.overflow = "hidden";
+      claimPreview.style.textOverflow = "ellipsis";
+      claimPreview.textContent = claim;
+
+      // Simple chevron indicator
+      const chevron = document.createElement("span");
+      chevron.style.marginLeft = "8px";
+      chevron.style.fontSize = "11px";
+      chevron.textContent = "▶";
+
+      const left = document.createElement("div");
+      left.style.display = "flex";
+      left.style.alignItems = "center";
+      left.appendChild(pill);
+      left.appendChild(claimPreview);
+
+      header.appendChild(left);
+      header.appendChild(chevron);
+
+      container.appendChild(header);
+
+      // Detail panel (initially hidden)
+      const detail = document.createElement("div");
+      detail.style.marginTop = "6px";
+      detail.style.fontSize = "12px";
+      detail.style.whiteSpace = "pre-wrap"; // keep newlines
+      detail.hidden = true;
+
+      function addField(label, value, { allowMarkdownLinks = false } = {}) {
+        if (!value) return;
+
+        const row = document.createElement("div");
+        row.style.marginBottom = "4px";
+
+        const title = document.createElement("div");
+        title.style.fontWeight = "600";
+        title.style.marginBottom = "2px";
+        title.textContent = label;
+
+        const body = document.createElement("div");
+        if (allowMarkdownLinks) {
+          body.innerHTML = renderMarkdownWithLinks(value);
+        } else {
+          body.textContent = value;
+        }
+
+        row.appendChild(title);
+        row.appendChild(body);
+        detail.appendChild(row);
       }
 
-      factCheckListEl.prepend(div);
-      if (factCheckListEl.childElementCount > 6) {
-        factCheckListEl.removeChild(factCheckListEl.lastElementChild);
+      // 1) Claim
+      addField("1) Claim", claim);
+
+      // 2) Classification
+      addField("2) Classification", classification);
+
+      // 3) Assessment (may contain markdown links)
+      addField("3) Assessment", assessment, { allowMarkdownLinks: true });
+
+      // 4) Disambiguation (may contain markdown links)
+      addField("4) Disambiguation", disambiguation, { allowMarkdownLinks: true });
+
+      // 5) Evidence (may contain markdown links)
+      addField("5) Evidence", evidence, { allowMarkdownLinks: true });
+
+      // Optional: source bias summary (under Evidence)
+      if (biasList.length) {
+        const sources = biasList
+          .map((b) => {
+            const biasVal =
+              typeof b.Bias === "number" ? b.Bias.toFixed(2) : "?";
+            const qualVal =
+              typeof b.Quality === "number" ? b.Quality.toFixed(1) : "?";
+            return `${b.url} (bias=${biasVal}, quality=${qualVal})`;
+          })
+          .join(" • ");
+
+        const row = document.createElement("div");
+        row.style.marginTop = "4px";
+        row.style.fontSize = "11px";
+        row.style.color = "#9aa0b8";
+        row.textContent = `Sources: ${sources}`;
+        detail.appendChild(row);
       }
+
+      container.appendChild(detail);
+
+      // Toggle detail on header click
+      header.onclick = () => {
+        const isHidden = detail.hidden;
+        detail.hidden = !isHidden;
+        chevron.textContent = isHidden ? "▼" : "▶";
+      };
+
+      // Newest on top
+      factCheckListEl.prepend(container);
     }
 
     document.getElementById("connectBtn").onclick = () => {
@@ -503,7 +630,6 @@
           } else if (msg.type === "final_utterance") {
             upsertUtteranceFromFinal(msg);
             renderTranscript();
-            appendFinalListItem(utterances.get(msg.utterance_id));
           } else if (msg.type === "session_started") {
             resetSessionState();
             log("Session started: " + JSON.stringify(msg.config));
@@ -516,7 +642,8 @@
             log(`[CTX][${msg.window_id}] wc=${wc} conf=${conf}\n${msg.text}`);
           } else if (msg.type === "fact_check_result") {
             appendFactCheckResult(msg);
-            log("Fact-check: " + (msg.classification || "unknown") + " / " + (msg.overall_assessment || "unknown"));
+            // Log full payload for debugging
+            log("Fact-check payload:\n" + JSON.stringify(msg, null, 2));
           } else {
             log("Event: " + e.data);
           }
@@ -545,6 +672,24 @@
       }
 
       log("Screen share started");
+
+      // Show preview of the shared tab/window in the bottom-right.
+      try {
+        screenPreviewVideo.srcObject = stream;
+        screenPreviewContainer.style.display = "block";
+
+        const hidePreview = () => {
+          screenPreviewVideo.srcObject = null;
+          screenPreviewContainer.style.display = "none";
+        };
+
+        // Hide when any track ends (user stops sharing from browser UI).
+        stream.getTracks().forEach(track => {
+          track.addEventListener("ended", hidePreview, { once: true });
+        });
+      } catch (e) {
+        console.error("Error attaching stream to preview video", e);
+      }
 
       // Audio pipeline in browser → PCM16 → WS
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
