@@ -19,6 +19,8 @@ DEEPGRAM_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?encoding=linear16"
     "&sample_rate=48000"
+    "&channels=2"
+    "&multichannel=true"
     # Model and formatting
     "&model=nova-3-general"
     "&punctuate=true"
@@ -183,6 +185,40 @@ class DeepgramASRProvider(ASRProvider):
         self._last_stable_speaker = speaker
         return speaker
 
+    def _extract_channel_index(
+        self,
+        data: Dict[str, Any],
+        channel: Dict[str, Any],
+        alt: Dict[str, Any],
+        words: List[Dict[str, Any]],
+    ) -> Optional[int]:
+        """
+        Try to pull a stable channel index from Deepgram responses.
+        DG may surface this at different keys depending on version.
+        """
+        candidates = [
+            data.get("channel_index"),
+            channel.get("channel_index"),
+            channel.get("channel"),
+            alt.get("channel_index"),
+            alt.get("channel"),
+            data.get("metadata", {}).get("channel_index"),
+            data.get("metadata", {}).get("channel"),
+        ]
+
+        # Check words if present (first non-null wins)
+        if words:
+            w0 = words[0]
+            candidates.append(w0.get("channel_index"))
+            candidates.append(w0.get("channel"))
+
+        idx = next((c for c in candidates if c is not None), None)
+
+        try:
+            return int(idx)
+        except Exception:
+            return None
+
     async def _handle_message(self, msg: Any) -> None:
         if self._on_event is None:
             return
@@ -228,10 +264,22 @@ class DeepgramASRProvider(ASRProvider):
             t_start = t_end = 0.0
 
         # ---------- Speaker & utterance ID handling ----------
-        # Use Deepgram diarization (word.speaker) to infer a stable speaker label,
-        # apply light smoothing, then maintain a single active utterance per speaker.
-        speaker_label, speaker_duration = self._infer_speaker(words)
-        speaker = self._stabilize_speaker_label(speaker_label, speaker_duration)
+        # Channel-based mapping:
+        #   ch 0 (mic)     -> always "user" (no diarization)
+        #   ch 1 (system)  -> keep diarization within system channel (system:spk_N)
+        # Fallback: if channel metadata is missing, use legacy diarization.
+        channel_index = self._extract_channel_index(data, channel, alt, words)
+
+        if channel_index == 0:
+            speaker = "user"
+        elif channel_index == 1:
+            sp_label, sp_dur = self._infer_speaker(words)
+            sp_label = self._stabilize_speaker_label(sp_label, sp_dur)
+            speaker = f"system:{sp_label}" if sp_label not in (None, "UNKNOWN") else "system"
+        else:
+            # Legacy path: single channel or no channel metadata
+            sp_label, sp_dur = self._infer_speaker(words)
+            speaker = self._stabilize_speaker_label(sp_label, sp_dur)
 
         utt_id = self._current_utt_by_speaker.get(speaker)
         if utt_id is None:

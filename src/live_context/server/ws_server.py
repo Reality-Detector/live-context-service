@@ -38,7 +38,7 @@ class WSServer:
                 if isinstance(message, (bytes, bytearray)):
                     frame = AudioFrame.now(
                         sample_rate=48000,   # matches Deepgram URL
-                        num_channels=1,
+                        num_channels=2,      # stereo: ch0=mic, ch1=system
                         data=bytes(message),
                     )
                     await self.session.asr_pipeline.push_frame(frame)

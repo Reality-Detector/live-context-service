@@ -660,9 +660,10 @@
         return;
       }
 
-      let stream;
+      let screenStream;
+      let micStream;
       try {
-        stream = await navigator.mediaDevices.getDisplayMedia({
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true
         });
@@ -671,11 +672,24 @@
         return;
       }
 
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+      } catch (err) {
+        log("Failed to access microphone: " + err);
+        return;
+      }
+
       log("Screen share started");
 
       // Show preview of the shared tab/window in the bottom-right.
       try {
-        screenPreviewVideo.srcObject = stream;
+        screenPreviewVideo.srcObject = screenStream;
         screenPreviewContainer.style.display = "block";
 
         const hidePreview = () => {
@@ -684,46 +698,57 @@
         };
 
         // Hide when any track ends (user stops sharing from browser UI).
-        stream.getTracks().forEach(track => {
+        screenStream.getTracks().forEach(track => {
           track.addEventListener("ended", hidePreview, { once: true });
         });
       } catch (e) {
         console.error("Error attaching stream to preview video", e);
       }
 
-      // Audio pipeline in browser → PCM16 → WS
+      // Audio pipeline in browser → stereo PCM16 (ch0=mic, ch1=system) → WS
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const source = audioContext.createMediaStreamSource(stream);
+
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      const sysSource = audioContext.createMediaStreamSource(screenStream);
+
+      // Merge into a 2-channel node: mic -> channel 0, system -> channel 1.
+      const merger = audioContext.createChannelMerger(2);
+      micSource.connect(merger, 0, 0);
+      sysSource.connect(merger, 0, 1);
 
       const bufferSize = 4096;
-      const inputChannels = 1;
-      const outputChannels = 1;
+      const inputChannels = 2;
+      const outputChannels = 2;
       processor = audioContext.createScriptProcessor(bufferSize, inputChannels, outputChannels);
 
       processor.onaudioprocess = (audioEvent) => {
         const inputBuffer = audioEvent.inputBuffer;
-        const channelData = inputBuffer.getChannelData(0); // Float32Array [-1, 1]
+        const ch0 = inputBuffer.getChannelData(0); // mic
+        // Some browsers may downmix; guard with fallback to ch0.
+        const ch1 = inputBuffer.numberOfChannels > 1 ? inputBuffer.getChannelData(1) : ch0; // system
 
-        const pcm16 = floatTo16BitPCM(channelData);
+        const pcm16 = floatStereoTo16BitPCM(ch0, ch1);
 
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(pcm16.buffer);
         }
       };
 
-      source.connect(processor);
+      // Connect graph; keep destination connection to ensure processing runs.
+      merger.connect(processor);
       processor.connect(audioContext.destination);
 
-      log("Streaming audio to server...");
+      log("Streaming audio (mic+system) to server...");
     };
 
-    function floatTo16BitPCM(float32Array) {
-      const len = float32Array.length;
-      const pcm16 = new Int16Array(len);
+    function floatStereoTo16BitPCM(ch0, ch1) {
+      const len = Math.min(ch0.length, ch1.length);
+      const pcm16 = new Int16Array(len * 2); // interleaved stereo
       for (let i = 0; i < len; i++) {
-        let s = float32Array[i];
-        s = Math.max(-1, Math.min(1, s));
-        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        let l = Math.max(-1, Math.min(1, ch0[i]));
+        let r = Math.max(-1, Math.min(1, ch1[i]));
+        pcm16[2 * i] = l < 0 ? l * 0x8000 : l * 0x7fff;
+        pcm16[2 * i + 1] = r < 0 ? r * 0x8000 : r * 0x7fff;
       }
       return pcm16;
     }
